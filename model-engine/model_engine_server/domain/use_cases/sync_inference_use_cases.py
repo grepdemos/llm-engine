@@ -1,3 +1,4 @@
+from model_engine_server.common.config import hmi_config
 from model_engine_server.common.dtos.tasks import (
     SyncEndpointPredictV1Request,
     SyncEndpointPredictV1Response,
@@ -71,6 +72,14 @@ class CreateSyncInferenceTaskV1UseCase:
         await autoscaling_metrics_gateway.emit_inference_autoscaling_metric(
             endpoint_id=model_endpoint_id
         )
+        # Hack: manually resolve dns if istio is present
+        manually_resolve_dns = (
+            model_endpoint.infra_state is not None
+            and model_endpoint.infra_state.resource_state.nodes_per_worker > 1
+            and hmi_config.istio_enabled
+        )
         return await inference_gateway.predict(
-            topic=model_endpoint.record.destination, predict_request=request
+            topic=model_endpoint.record.destination,
+            predict_request=request,
+            manually_resolve_dns=manually_resolve_dns,
         )

@@ -497,12 +497,31 @@ class CreateLLMModelBundleV1UseCase:
         quantize: Optional[Quantization],
         checkpoint_path: Optional[str],
         chat_template_override: Optional[str],
+        nodes_per_worker: int,
+        # TODO multinode_size instead of multinode
     ) -> ModelBundle:
+        multinode = nodes_per_worker > 1
         if source == LLMSource.HUGGING_FACE:
             self.check_docker_image_exists_for_image_tag(
                 framework_image_tag, INFERENCE_FRAMEWORK_REPOSITORY[framework]
             )
-            if framework == LLMInferenceFramework.DEEPSPEED:
+            if multinode and framework == LLMInferenceFramework.VLLM:
+                bundle_id = await self.create_vllm_multinode_bundle(
+                    user,
+                    model_name,
+                    framework_image_tag,
+                    endpoint_name,
+                    num_shards,
+                    nodes_per_worker,
+                    quantize,
+                    checkpoint_path,
+                    chat_template_override,
+                )
+            elif multinode:
+                raise ObjectHasInvalidValueException(
+                    f"Multinode is not supported for framework {framework}."
+                )
+            elif framework == LLMInferenceFramework.DEEPSPEED:
                 bundle_id = await self.create_deepspeed_bundle(
                     user,
                     model_name,
@@ -809,17 +828,21 @@ class CreateLLMModelBundleV1UseCase:
                 )
             ).model_bundle_id
 
-    async def create_vllm_bundle(
+    def _create_vllm_bundle_command(
         self,
-        user: User,
         model_name: str,
         framework_image_tag: str,
-        endpoint_unique_name: str,
         num_shards: int,
         quantize: Optional[Quantization],
         checkpoint_path: Optional[str],
         chat_template_override: Optional[str],
+        multinode: bool,
+        is_leader: bool,
+        nodes_per_worker: int = 1,  # only used if multinode
     ):
+        """
+        VLLM start command for the single worker, or the leader in a LeaderWorkerSet.
+        """
         command = []
         subcommands = []
 
@@ -836,32 +859,46 @@ class CreateLLMModelBundleV1UseCase:
             final_weights_folder,
         )
 
-        vllm_cmd = f"python -m vllm_server --model {final_weights_folder} --tensor-parallel-size {num_shards} --port 5005"
+        vllm_cmd = ""
 
-        chat_template_cmd = None
-        if chat_template_override:
-            # We encode the chat template as base64 to avoid issues with special characters
-            # and decode it via bash
-            chat_template_cmd = f'export CHAT_TEMPLATE=$(echo "{encode_template(chat_template_override)}" | base64 --decode)'
-            subcommands.append(chat_template_cmd)
-            vllm_cmd += ' --chat-template "$CHAT_TEMPLATE"'
+        if multinode and is_leader:
+            vllm_cmd += "/workspace/init_ray.sh leader --ray_cluster_size=$RAY_CLUSTER_SIZE --own_address=$K8S_OWN_POD_NAME.$K8S_LWS_NAME.$K8S_OWN_NAMESPACE.svc.cluster.local; "
+        elif multinode and not is_leader:
+            vllm_cmd += "/workspace/init_ray.sh worker --ray_address=$LWS_LEADER_ADDRESS.svc.cluster.local --own_address=$K8S_OWN_POD_NAME.$K8S_LWS_NAME.$K8S_OWN_NAMESPACE.svc.cluster.local"
 
-        if quantize:  # pragma: no cover
-            if quantize != Quantization.AWQ:
-                raise InvalidRequestException(f"Quantization {quantize} is not supported by vLLM.")
+        if is_leader:
+            vllm_cmd += f"python -m vllm_server --model {final_weights_folder} --tensor-parallel-size {num_shards} --port 5005"
 
-            vllm_cmd += f" --quantization {quantize}"
+            if multinode:
+                vllm_cmd += f" --pipeline-parallel-size {nodes_per_worker}"
+            # TODO pipeline parallel also
 
-        if hmi_config.sensitive_log_mode:  # pragma: no cover
-            vllm_cmd += " --disable-log-requests"
+            chat_template_cmd = None
+            if chat_template_override:
+                # We encode the chat template as base64 to avoid issues with special characters
+                # and decode it via bash
+                chat_template_cmd = f'export CHAT_TEMPLATE=$(echo "{encode_template(chat_template_override)}" | base64 --decode)'
+                subcommands.append(chat_template_cmd)
+                vllm_cmd += ' --chat-template "$CHAT_TEMPLATE"'
 
-        additional_args = infer_addition_engine_args_from_model_name(model_name)
+            if quantize:  # pragma: no cover
+                if quantize != Quantization.AWQ:
+                    raise InvalidRequestException(
+                        f"Quantization {quantize} is not supported by vLLM."
+                    )
 
-        if additional_args.max_gpu_memory_utilization:
-            vllm_cmd += f" --gpu-memory-utilization {additional_args.max_gpu_memory_utilization} --enforce-eager"
+                vllm_cmd += f" --quantization {quantize}"
 
-        if additional_args.attention_backend:
-            vllm_cmd += " --attention-backend FLASHINFER"
+            if hmi_config.sensitive_log_mode:  # pragma: no cover
+                vllm_cmd += " --disable-log-requests"
+
+            additional_args = infer_addition_engine_args_from_model_name(model_name)
+
+            if additional_args.max_gpu_memory_utilization:
+                vllm_cmd += f" --gpu-memory-utilization {additional_args.max_gpu_memory_utilization} --enforce-eager"
+
+            if additional_args.attention_backend:
+                vllm_cmd += " --attention-backend FLASHINFER"
 
         subcommands.append(vllm_cmd)
         command = [
@@ -870,28 +907,136 @@ class CreateLLMModelBundleV1UseCase:
             ";".join(subcommands),
         ]
 
+        return command
+
+    async def create_vllm_bundle(
+        self,
+        user: User,
+        model_name: str,
+        framework_image_tag: str,
+        endpoint_unique_name: str,
+        num_shards: int,
+        quantize: Optional[Quantization],
+        checkpoint_path: Optional[str],
+        chat_template_override: Optional[str],
+    ):
+        command = self._create_vllm_bundle_command(
+            model_name,
+            framework_image_tag,
+            num_shards,
+            quantize,
+            checkpoint_path,
+            chat_template_override,
+            multinode=False,
+            is_leader=True,
+            nodes_per_worker=1,
+        )
+
+        create_model_bundle_v2_request = CreateModelBundleV2Request(
+            name=endpoint_unique_name,
+            schema_location="TBA",
+            flavor=StreamingEnhancedRunnableImageFlavor(
+                flavor=ModelBundleFlavorType.STREAMING_ENHANCED_RUNNABLE_IMAGE,
+                repository=hmi_config.vllm_repository,
+                tag=framework_image_tag,
+                command=command,
+                streaming_command=command,
+                protocol="http",
+                readiness_initial_delay_seconds=10,
+                healthcheck_route="/health",
+                predict_route="/predict",
+                streaming_predict_route="/stream",
+                extra_routes=[OPENAI_CHAT_COMPLETION_PATH],
+                env={},
+            ),
+            metadata={},
+        )
+
         return (
             await self.create_model_bundle_use_case.execute(
                 user,
-                CreateModelBundleV2Request(
-                    name=endpoint_unique_name,
-                    schema_location="TBA",
-                    flavor=StreamingEnhancedRunnableImageFlavor(
-                        flavor=ModelBundleFlavorType.STREAMING_ENHANCED_RUNNABLE_IMAGE,
-                        repository=hmi_config.vllm_repository,
-                        tag=framework_image_tag,
-                        command=command,
-                        streaming_command=command,
-                        protocol="http",
-                        readiness_initial_delay_seconds=10,
-                        healthcheck_route="/health",
-                        predict_route="/predict",
-                        streaming_predict_route="/stream",
-                        extra_routes=[OPENAI_CHAT_COMPLETION_PATH],
-                        env={},
-                    ),
-                    metadata={},
-                ),
+                create_model_bundle_v2_request,
+                do_auth_check=False,
+                # Skip auth check because llm create endpoint is called as the user itself,
+                # but the user isn't directly making the action. It should come from the fine tune
+                # job.
+            )
+        ).model_bundle_id
+
+    async def create_vllm_multinode_bundle(
+        self,
+        user: User,
+        model_name: str,
+        framework_image_tag: str,
+        endpoint_unique_name: str,
+        num_shards: int,
+        nodes_per_worker: int,
+        quantize: Optional[Quantization],
+        checkpoint_path: Optional[str],
+        chat_template_override: Optional[str],
+    ):
+        leader_command = self._create_vllm_bundle_command(
+            model_name,
+            framework_image_tag,
+            num_shards,
+            quantize,
+            checkpoint_path,
+            chat_template_override,
+            multinode=True,
+            is_leader=True,
+            nodes_per_worker=nodes_per_worker,
+        )
+        worker_command = self._create_vllm_bundle_command(
+            model_name,
+            framework_image_tag,
+            num_shards,
+            quantize,
+            checkpoint_path,
+            chat_template_override,
+            multinode=True,
+            is_leader=False,
+            nodes_per_worker=nodes_per_worker,
+        )
+
+        # These env vars e.g. leader name, lws name, namespace should be filled in by Launch automatically
+        common_vllm_envs = {
+            "VLLM_HOST_IP": "$(LWS_LEADER_ADDRESS).svc.cluster.local",
+            "NCCL_SOCKET_IFNAME": "eth0",
+            "GLOO_SOCKET_IFNAME": "eth0",  # maybe don't need
+            "NCCL_DEBUG": "INFO",  # TODO remove once fully tested
+            "VLLM_LOGGING_LEVEL": "INFO",  # TODO remove once fully tested
+            "RAY_CLUSTER_SIZE": "$(K8S_LWS_CLUSTER_SIZE)",
+        }
+
+        leader_env = common_vllm_envs.copy()
+        worker_env = common_vllm_envs.copy()
+
+        create_model_bundle_v2_request = CreateModelBundleV2Request(
+            name=endpoint_unique_name,
+            schema_location="TBA",
+            flavor=StreamingEnhancedRunnableImageFlavor(
+                flavor=ModelBundleFlavorType.STREAMING_ENHANCED_RUNNABLE_IMAGE,
+                repository=hmi_config.vllm_repository,
+                tag=framework_image_tag,
+                command=leader_command,
+                streaming_command=leader_command,
+                protocol="http",
+                readiness_initial_delay_seconds=10,
+                healthcheck_route="/health",
+                predict_route="/predict",
+                streaming_predict_route="/stream",
+                extra_routes=[OPENAI_CHAT_COMPLETION_PATH],
+                env=leader_env,
+                worker_command=worker_command,
+                worker_env=worker_env,
+            ),
+            metadata={},
+        )
+
+        return (
+            await self.create_model_bundle_use_case.execute(
+                user,
+                create_model_bundle_v2_request,
                 do_auth_check=False,
                 # Skip auth check because llm create endpoint is called as the user itself,
                 # but the user isn't directly making the action. It should come from the fine tune
@@ -1060,6 +1205,7 @@ class CreateLLMModelEndpointV1UseCase:
             and request.cpus
             and request.memory
             and request.storage
+            and request.nodes_per_worker
         ):
             raise RuntimeError("Some hardware info is missing unexpectedly.")
         validate_deployment_resources(
@@ -1098,6 +1244,14 @@ class CreateLLMModelEndpointV1UseCase:
                 request.inference_framework
             )
 
+        if (
+            request.nodes_per_worker > 1
+            and not request.inference_framework == LLMInferenceFramework.VLLM
+        ):
+            raise ObjectHasInvalidValueException(
+                "Multinode endpoints are only supported for VLLM models."
+            )
+
         bundle = await self.create_llm_model_bundle_use_case.execute(
             user,
             endpoint_name=request.name,
@@ -1110,6 +1264,7 @@ class CreateLLMModelEndpointV1UseCase:
             quantize=request.quantize,
             checkpoint_path=request.checkpoint_path,
             chat_template_override=request.chat_template_override,
+            nodes_per_worker=request.nodes_per_worker,
         )
         validate_resource_requests(
             bundle=bundle,
@@ -1157,6 +1312,7 @@ class CreateLLMModelEndpointV1UseCase:
             memory=request.memory,
             gpu_type=request.gpu_type,
             storage=request.storage,
+            nodes_per_worker=request.nodes_per_worker,
             optimize_costs=bool(request.optimize_costs),
             min_workers=request.min_workers,
             max_workers=request.max_workers,
@@ -1367,6 +1523,7 @@ class UpdateLLMModelEndpointV1UseCase:
                 quantize=quantize,
                 checkpoint_path=checkpoint_path,
                 chat_template_override=chat_template_override,
+                nodes_per_worker=model_endpoint.infra_state.resource_state.nodes_per_worker,
             )
 
             metadata = endpoint_record.metadata or {}
@@ -1790,6 +1947,12 @@ class CompletionSyncV1UseCase:
             endpoint_id=model_endpoint.record.id
         )
         endpoint_content = _model_endpoint_entity_to_get_llm_model_endpoint_response(model_endpoint)
+
+        manually_resolve_dns = (
+            model_endpoint.infra_state is not None
+            and model_endpoint.infra_state.resource_state.nodes_per_worker > 1
+            and hmi_config.istio_enabled
+        )
         validated_request = validate_and_update_completion_params(
             endpoint_content.inference_framework, request
         )
@@ -1822,6 +1985,7 @@ class CompletionSyncV1UseCase:
             predict_result = await inference_gateway.predict(
                 topic=model_endpoint.record.destination,
                 predict_request=inference_request,
+                manually_resolve_dns=manually_resolve_dns,
             )
 
             if predict_result.status == TaskStatus.SUCCESS and predict_result.result is not None:
@@ -1871,6 +2035,7 @@ class CompletionSyncV1UseCase:
             predict_result = await inference_gateway.predict(
                 topic=model_endpoint.record.destination,
                 predict_request=inference_request,
+                manually_resolve_dns=manually_resolve_dns,
             )
 
             if predict_result.status != TaskStatus.SUCCESS or predict_result.result is None:
@@ -1930,6 +2095,7 @@ class CompletionSyncV1UseCase:
             predict_result = await inference_gateway.predict(
                 topic=model_endpoint.record.destination,
                 predict_request=inference_request,
+                manually_resolve_dns=manually_resolve_dns,
             )
 
             if predict_result.status != TaskStatus.SUCCESS or predict_result.result is None:
@@ -1980,6 +2146,7 @@ class CompletionSyncV1UseCase:
             predict_result = await inference_gateway.predict(
                 topic=model_endpoint.record.destination,
                 predict_request=inference_request,
+                manually_resolve_dns=manually_resolve_dns,
             )
 
             if predict_result.status != TaskStatus.SUCCESS or predict_result.result is None:
@@ -2023,6 +2190,7 @@ class CompletionSyncV1UseCase:
             predict_result = await inference_gateway.predict(
                 topic=model_endpoint.record.destination,
                 predict_request=inference_request,
+                manually_resolve_dns=manually_resolve_dns,
             )
 
             if predict_result.status != TaskStatus.SUCCESS or predict_result.result is None:
@@ -2143,6 +2311,12 @@ class CompletionStreamV1UseCase:
                 f"request has type {validated_request.__class__.__name__}, expected type CompletionStreamV1Request"
             )
         request = validated_request
+
+        manually_resolve_dns = (
+            model_endpoint.infra_state is not None
+            and model_endpoint.infra_state.resource_state.nodes_per_worker > 1
+            and hmi_config.istio_enabled
+        )
 
         args: Any = None
         num_prompt_tokens = None
@@ -2275,6 +2449,7 @@ class CompletionStreamV1UseCase:
             inference_gateway=inference_gateway,
             inference_request=inference_request,
             num_prompt_tokens=num_prompt_tokens,
+            manually_resolve_dns=manually_resolve_dns,
         )
 
     async def _response_chunk_generator(
@@ -2286,13 +2461,16 @@ class CompletionStreamV1UseCase:
         inference_gateway: StreamingModelEndpointInferenceGateway,
         inference_request: SyncEndpointPredictV1Request,
         num_prompt_tokens: Optional[int],
+        manually_resolve_dns: bool,
     ) -> AsyncIterable[CompletionStreamV1Response]:
         """
         Async generator yielding tokens to stream for the completions response. Should only be called when
         returned directly by execute().
         """
         predict_result = inference_gateway.streaming_predict(
-            topic=model_endpoint.record.destination, predict_request=inference_request
+            topic=model_endpoint.record.destination,
+            predict_request=inference_request,
+            manually_resolve_dns=manually_resolve_dns,
         )
 
         num_completion_tokens = 0
@@ -2528,6 +2706,12 @@ class ChatCompletionSyncV2UseCase:
         )
         endpoint_content = _model_endpoint_entity_to_get_llm_model_endpoint_response(model_endpoint)
 
+        manually_resolve_dns = (
+            model_endpoint.infra_state is not None
+            and model_endpoint.infra_state.resource_state.nodes_per_worker > 1
+            and hmi_config.istio_enabled
+        )
+
         validate_endpoint_supports_chat_completion(model_endpoint, endpoint_content)
 
         # if inference framework is VLLM, we need to set the model to use the weights folder
@@ -2544,6 +2728,7 @@ class ChatCompletionSyncV2UseCase:
             predict_result = await inference_gateway.predict(
                 topic=model_endpoint.record.destination,
                 predict_request=inference_request,
+                manually_resolve_dns=manually_resolve_dns,
             )
 
             if predict_result.status != TaskStatus.SUCCESS or predict_result.result is None:
@@ -2626,6 +2811,12 @@ class ChatCompletionStreamV2UseCase:
         )
 
         model_content = _model_endpoint_entity_to_get_llm_model_endpoint_response(model_endpoint)
+
+        manually_resolve_dns = (
+            model_endpoint.infra_state is not None
+            and model_endpoint.infra_state.resource_state.nodes_per_worker > 1
+            and hmi_config.istio_enabled
+        )
         validate_endpoint_supports_chat_completion(model_endpoint, model_content)
 
         # if inference framework is VLLM, we need to set the model to use the weights folder
@@ -2645,6 +2836,7 @@ class ChatCompletionStreamV2UseCase:
             model_content=model_content,
             inference_gateway=inference_gateway,
             inference_request=inference_request,
+            manually_resolve_dns=manually_resolve_dns,
         )
 
     async def _response_chunk_generator(
@@ -2654,6 +2846,7 @@ class ChatCompletionStreamV2UseCase:
         model_content: GetLLMModelEndpointV1Response,
         inference_gateway: StreamingModelEndpointInferenceGateway,
         inference_request: SyncEndpointPredictV1Request,
+        manually_resolve_dns: bool,
     ) -> AsyncIterable[ChatCompletionV2SuccessChunk]:
         """
         Async generator yielding tokens to stream for the completions response. Should only be called when
@@ -2663,6 +2856,7 @@ class ChatCompletionStreamV2UseCase:
             predict_result = inference_gateway.streaming_predict(
                 topic=model_endpoint.record.destination,
                 predict_request=inference_request,
+                manually_resolve_dns=manually_resolve_dns,
             )
         except UpstreamServiceError as exc:
             # Expect upstream inference service to handle bulk of input validation
@@ -2728,6 +2922,7 @@ async def _fill_hardware_info(
         or request.cpus is None
         or request.memory is None
         or request.storage is None
+        or request.nodes_per_worker is None
     ):
         if not (
             request.gpus is None
@@ -2735,9 +2930,10 @@ async def _fill_hardware_info(
             and request.cpus is None
             and request.memory is None
             and request.storage is None
+            and request.nodes_per_worker is None
         ):
             raise ObjectHasInvalidValueException(
-                "All hardware spec fields (gpus, gpu_type, cpus, memory, storage) must be provided if any hardware spec field is missing."
+                "All hardware spec fields (gpus, gpu_type, cpus, memory, storage, nodes_per_worker) must be provided if any hardware spec field is missing."
             )
         checkpoint_path = get_checkpoint_path(request.model_name, request.checkpoint_path)
         hardware_info = await _infer_hardware(
@@ -2748,6 +2944,7 @@ async def _fill_hardware_info(
         request.cpus = hardware_info.cpus
         request.memory = hardware_info.memory
         request.storage = hardware_info.storage
+        request.nodes_per_worker = hardware_info.nodes_per_worker
         if hardware_info.gpus:  # make lint happy
             request.num_shards = hardware_info.gpus
 
@@ -2824,6 +3021,7 @@ async def _infer_hardware(
         memory = by_model_name[model_name]["memory"]
         storage = by_model_name[model_name]["storage"]
         gpu_type = by_model_name[model_name]["gpu_type"]
+        nodes_per_worker = by_model_name[model_name]["nodes_per_worker"]
     else:
         by_gpu_memory_gb = sorted(by_gpu_memory_gb, key=lambda x: x["gpu_memory_le"])
         for recs in by_gpu_memory_gb:
@@ -2833,12 +3031,18 @@ async def _infer_hardware(
                 memory = recs["memory"]
                 storage = recs["storage"]
                 gpu_type = recs["gpu_type"]
+                nodes_per_worker = recs["nodes_per_worker"]
                 break
         else:
             raise ObjectHasInvalidValueException(f"Unable to infer hardware for {model_name}.")
 
     return CreateDockerImageBatchJobResourceRequests(
-        cpus=cpus, gpus=gpus, memory=memory, storage=storage, gpu_type=gpu_type
+        cpus=cpus,
+        gpus=gpus,
+        memory=memory,
+        storage=storage,
+        gpu_type=gpu_type,
+        nodes_per_worker=nodes_per_worker,
     )
 
 
